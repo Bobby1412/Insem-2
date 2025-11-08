@@ -1,0 +1,190 @@
+---
+- name: Deploy Hospital Management System to Kubernetes using Ansible
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+
+  vars:
+    project_root: "{{ playbook_dir }}/.."
+    backend_image: "hospital-backend:latest"
+    frontend_image: "hospital-frontend:latest"
+    frontend_nodeport: 30082
+    backend_nodeport: 30083
+    namespace: "hospital-system"
+
+  tasks:
+    # =========================
+    # Prerequisites Check
+    # =========================
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if Docker is not installed
+      fail:
+        msg: "Docker is not installed. Please install Docker first."
+      when: docker_check.rc != 0
+
+    - name: Check if kubectl is installed
+      command: kubectl version --client
+      register: kubectl_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if kubectl is not installed
+      fail:
+        msg: "kubectl is not installed. Please install kubectl first."
+      when: kubectl_check.rc != 0
+
+    # =========================
+    # Start Minikube and configure Docker
+    # =========================
+    - name: Check Minikube status
+      command: minikube status
+      register: minikube_status
+      changed_when: false
+      failed_when: false
+
+    - name: Start Minikube if not running
+      command: minikube start --driver=docker --memory=4096 --cpus=2
+      when: minikube_status.rc != 0
+      register: minikube_start
+
+    - name: Get Minikube IP
+      command: minikube ip
+      register: minikube_ip_result
+      changed_when: false
+
+    - name: Set Minikube IP variable
+      set_fact:
+        minikube_ip: "{{ minikube_ip_result.stdout }}"
+
+    - name: Configure shell to use Minikube's Docker daemon
+      shell: eval $(minikube docker-env) && docker info
+      register: docker_env_check
+      changed_when: false
+
+    # =========================
+    # Build Docker Images
+    # =========================
+    - name: Build Backend Docker Image
+      shell: |
+        eval $(minikube docker-env)
+        docker build -f {{ project_root }}/Dockerfile.backend -t {{ backend_image }} {{ project_root }}
+      args:
+        executable: /bin/bash
+
+    - name: Build Frontend Docker Image
+      shell: |
+        eval $(minikube docker-env)
+        docker build \
+          --build-arg REACT_APP_BACKEND_URL=http://{{ minikube_ip }}:{{ backend_nodeport }} \
+          --build-arg VITE_BACKEND_URL=http://{{ minikube_ip }}:{{ backend_nodeport }} \
+          -f {{ project_root }}/Dockerfile.frontend \
+          -t {{ frontend_image }} \
+          {{ project_root }}
+      args:
+        executable: /bin/bash
+
+    # =========================
+    # Create Kubernetes manifests with variables
+    # =========================
+    - name: Create namespace directory
+      file:
+        path: /tmp/k8s-manifests
+        state: directory
+
+    - name: Generate Kubernetes deployment manifest
+      template:
+        src: templates/deployment.yaml.j2
+        dest: /tmp/k8s-manifests/deployment.yaml
+      vars:
+        minikube_ip: "{{ minikube_ip }}"
+        backend_nodeport: "{{ backend_nodeport }}"
+        frontend_nodeport: "{{ frontend_nodeport }}"
+        namespace: "{{ namespace }}"
+        backend_image: "{{ backend_image }}"
+        frontend_image: "{{ frontend_image }}"
+
+    # =========================
+    # Deploy to Kubernetes
+    # =========================
+    - name: Create Kubernetes namespace
+      command: kubectl create namespace {{ namespace }} --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Apply Kubernetes manifests
+      command: kubectl apply -f /tmp/k8s-manifests/deployment.yaml
+
+    # =========================
+    # Wait for deployments
+    # =========================
+    - name: Wait for MySQL pod to be ready
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=mysql -n {{ namespace }} --timeout=300s
+      args:
+        executable: /bin/bash
+      register: mysql_wait
+      until: mysql_wait.rc == 0
+      retries: 30
+      delay: 10
+
+    - name: Wait for Backend pods to be ready
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=backend -n {{ namespace }} --timeout=600s
+      args:
+        executable: /bin/bash
+      register: backend_wait
+      until: backend_wait.rc == 0
+      retries: 60
+      delay: 10
+
+    - name: Wait for Frontend pods to be ready
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=frontend -n {{ namespace }} --timeout=300s
+      args:
+        executable: /bin/bash
+      register: frontend_wait
+      until: frontend_wait.rc == 0
+      retries: 30
+      delay: 10
+
+    # =========================
+    # Display deployment information
+    # =========================
+    - name: Get all pods
+      command: kubectl get pods -n {{ namespace }}
+      register: pods_output
+
+    - name: Display pods status
+      debug:
+        msg: "{{ pods_output.stdout_lines }}"
+
+    - name: Get all services
+      command: kubectl get svc -n {{ namespace }}
+      register: svc_output
+
+    - name: Display services status
+      debug:
+        msg: "{{ svc_output.stdout_lines }}"
+
+    - name: Display access URLs
+      debug:
+        msg:
+          - "=========================================="
+          - "✅ Deployment Complete!"
+          - "=========================================="
+          - "Minikube IP: {{ minikube_ip }}"
+          - "Frontend URL: http://{{ minikube_ip }}:{{ frontend_nodeport }}"
+          - "Backend URL:  http://{{ minikube_ip }}:{{ backend_nodeport }}"
+          - "=========================================="
+          - "To access via port-forward (alternative):"
+          - "  Frontend: kubectl port-forward -n {{ namespace }} svc/frontend {{ frontend_nodeport }}:80"
+          - "  Backend:  kubectl port-forward -n {{ namespace }} svc/backend {{ backend_nodeport }}:8080"
+          - "=========================================="
+          - "To view logs:"
+          - "  Backend:  kubectl logs -n {{ namespace }} -l app=backend -f"
+          - "  Frontend: kubectl logs -n {{ namespace }} -l app=frontend -f"
+          - "  MySQL:    kubectl logs -n {{ namespace }} -l app=mysql -f"
+          - "=========================================="

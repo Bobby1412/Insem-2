@@ -1,0 +1,85 @@
+---
+- name: Fullstack App Deployment on WSL
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+
+  vars:
+    k8s_manifest_path: "../k8s/fullstackdeployment.yaml"
+    frontend_nodeport: 30082
+    backend_nodeport: 30083
+
+  tasks:
+
+    - name: Gather system facts
+      ansible.builtin.setup:
+
+    - name: Ensure Docker service is running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Start Minikube (if not running)
+      shell: |
+        if ! minikube status 2>/dev/null | grep -q "Running"; then
+          echo "Starting Minikube using Docker driver..."
+          minikube start --driver=docker --memory=2000 --cpus=2
+        else
+          echo "Minikube already running."
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Copy Kubernetes deployment file
+      ansible.builtin.copy:
+        src: "{{ k8s_manifest_path }}"
+        dest: /tmp/fullstackdeployment.yaml
+        force: yes
+
+    - name: Apply Kubernetes manifests
+      shell: kubectl apply -f /tmp/fullstackdeployment.yaml
+      args:
+        executable: /bin/bash
+
+    - name: Wait for all pods to be running
+      shell: |
+        kubectl get pods --no-headers | grep -v Running || true
+      register: pod_status
+      until: pod_status.stdout == ""
+      retries: 20
+      delay: 10
+      args:
+        executable: /bin/bash
+
+    - name: Display all services
+      shell: kubectl get svc
+      register: svc_output
+      args:
+        executable: /bin/bash
+
+    - name: Print services table
+      debug:
+        msg: "{{ svc_output.stdout }}"
+
+    # -------------------------------
+    # NodePort forwarding (background)
+    # Keeps services accessible even after terminal closes
+    # -------------------------------
+    - name: Forward backend service port 30083 -> 8080 (background)
+      shell: |
+        nohup kubectl port-forward svc/backend {{ backend_nodeport }}:8080 >/dev/null 2>&1 &
+      args:
+        executable: /bin/bash
+
+    - name: Forward frontend service port 30082 -> 8080 (background)
+      shell: |
+        nohup kubectl port-forward svc/frontend {{ frontend_nodeport }}:8080 >/dev/null 2>&1 &
+      args:
+        executable: /bin/bash
+
+    - name: Show access URLs
+      debug:
+        msg:
+          - "✅ Frontend: http://localhost:{{ frontend_nodeport }}/ecommerce/"
+          - "✅ Backend:  http://localhost:{{ backend_nodeport }}/back1/"
